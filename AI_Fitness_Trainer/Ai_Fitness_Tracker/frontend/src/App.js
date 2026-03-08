@@ -5,6 +5,7 @@ import { WorkoutProvider } from './contexts/WorkoutContext';
 import Layout from './components/Layout';
 import DuelManager from './components/DuelManager';
 import NotificationToast from './components/NotificationToast';
+import { Analytics } from '@vercel/analytics/react';
 
 // Lazy load screens for better initial load performance
 const Login = lazy(() => import('./screens/Login'));
@@ -115,6 +116,7 @@ function App() {
             <DuelManager />
             <NotificationToast />
             <AppRoutes />
+            <Analytics />
           </div>
         </Router>
       </WorkoutProvider>
