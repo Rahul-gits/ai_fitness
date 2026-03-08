@@ -1,13 +1,16 @@
 from fastapi import FastAPI, Request, status
+from contextlib import asynccontextmanager
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.exc import IntegrityError
 from fastapi.responses import JSONResponse
 import logging
+from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import os
-from .core.config import settings
-from .core.redis import redis_service
+import uvicorn
+from app.core.config import settings
+from app.core.redis import redis_service
 from .core.middleware import RateLimitMiddleware
 from .db.database import sync_engine, Base
 from .api.v1.auth import router as auth_router
@@ -24,46 +27,66 @@ from .api.v1.water import router as water_router
 from .api.v1.chatbot import router as chatbot_router
 from .api.v1.ai import router as ai_router
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title=settings.PROJECT_NAME)
+logging.getLogger("sqlalchemy.engine").setLevel(logging.ERROR)
+logging.getLogger("sqlalchemy.pool").setLevel(logging.ERROR)
+logging.getLogger("uvicorn").setLevel(logging.ERROR)
+# Lifespan context manager with error handling
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    try:
+        await redis_service.connect()
+        logger.info("Redis connected")
+    except Exception as e:
+        logger.warning(f"Redis connection failed: {e}")
+    
+    logger.info("Application startup complete")
+    yield
+    
+    # Shutdown
+    try:
+        await redis_service.disconnect()
+        logger.info("Redis disconnected")
+    except Exception as e:
+        logger.warning(f"Redis disconnect error: {e}")
+    
+    logger.info("Application shutdown complete")
+
+app = FastAPI(title=settings.PROJECT_NAME, lifespan=lifespan)
 
 # Mount static files
-# Get absolute path to static directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# Exception handler for database integrity errors (e.g. unique constraints)
+# Exception handlers
 @app.exception_handler(IntegrityError)
 async def integrity_exception_handler(request: Request, exc: IntegrityError):
     logger.error(f"Integrity error: {str(exc)}")
     return JSONResponse(
         status_code=status.HTTP_400_BAD_REQUEST,
-        content={"detail": "Database integrity error. This usually means a unique constraint failed (e.g. username or email already exists)."},
+        content={"detail": "Database integrity error. Unique constraint failed."},
     )
 
-# General exception handler to ensure CORS headers on 500s
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "Internal server error. Please check server logs."},
+        content={"detail": "Internal server error"},
     )
 
-# Custom exception handler for validation errors
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     errors = []
     for error in exc.errors():
         loc = error.get("loc")
         msg = error.get("msg")
-        # Simplify error message for frontend
         field = loc[-1] if loc else "field"
         errors.append(f"{field}: {msg}")
     
@@ -72,23 +95,17 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         content={"detail": ", ".join(errors)},
     )
 
-# Create database tables (Sync for startup, better to use Alembic in prod)
-# Only run this if not using migrations
+# Create database tables
 Base.metadata.create_all(bind=sync_engine)
 
-@app.on_event("startup")
-async def startup_event():
-    await redis_service.connect()
-    # If using postgres, we might want to ensure connection here
+# Health check endpoints
+@app.get("/")
+def root():
+    return {"message": "AI Fitness Backend Running 🚀"}
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    await redis_service.disconnect()
-
-# Security headers middleware
-# @app.middleware("http")
-# async def add_security_headers(request: Request, call_next):
-#    ... (rest of the code)
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 @app.get("/api/v1/test")
 async def test_endpoint():
@@ -109,10 +126,8 @@ app.include_router(water_router, prefix=settings.API_V1_STR)
 app.include_router(chatbot_router, prefix=settings.API_V1_STR)
 app.include_router(ai_router, prefix=settings.API_V1_STR)
 
-# Add RateLimitMiddleware
+# Middleware
 app.add_middleware(RateLimitMiddleware, redis_service=redis_service, limit=100, window=60)
-
-# CORS configuration (Added LAST so it wraps everything else and runs FIRST for requests)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -121,9 +136,3 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-def root():
-    return {
-        "status": "Backend running", 
-        "docs_url": "/docs"
-    }

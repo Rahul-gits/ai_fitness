@@ -17,7 +17,7 @@ const getApiBaseUrl = () => {
       return 'http://localhost:8000';
     }
     // Otherwise use the IP address (for mobile testing)
-    return `http://${hostname}:8000`;
+    return 'https://ai-fitness-backend-production-546d.up.railway.app/';
   }
 
   // Fallback for non-browser environments
@@ -28,7 +28,7 @@ export const API_BASE_URL = getApiBaseUrl();
 export const API_V1_STR = '/api/v1';
 export const API_URL = `${API_BASE_URL}${API_V1_STR}`;
 export const AUTH_URL = `${API_URL}/auth`;
-export const WS_URL = API_BASE_URL.replace('http', 'ws');
+export const WS_URL = API_BASE_URL.replace('https', 'wss').replace('http', 'ws');
 
 export const REQUEST_TIMEOUT = 15000;
 
