@@ -1,5 +1,6 @@
 import React, { Suspense, lazy } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import { SpeedInsights } from '@vercel/speed-insights/react';
 import { AppProvider, useApp } from './contexts/AppContext';
 import { WorkoutProvider } from './contexts/WorkoutContext';
 import Layout from './components/Layout';
@@ -115,6 +116,7 @@ function App() {
             <DuelManager />
             <NotificationToast />
             <AppRoutes />
+            <SpeedInsights />
           </div>
         </Router>
       </WorkoutProvider>
