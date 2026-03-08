@@ -14,9 +14,11 @@ logger = logging.getLogger(__name__)
 try:
     from ...core_ai.pose.pose_detector import detect_pose
 except ImportError:
+    logger.warning("Pose detector import failed - falling back to dummy implementation")
     def detect_pose(*args, **kwargs):
         return None, None, None
-except Exception:
+except Exception as e:
+    logger.error(f"Pose detector error: {e}", exc_info=True)
     def detect_pose(*args, **kwargs):
         return None, None, None
 
@@ -28,7 +30,8 @@ from .voice_commands import get_user_context, format_fitness_summary
 
 try:
     from ...core_ai.coach.llm_coach import stream_llm_async, PERSONA_PROMPTS
-except Exception:
+except Exception as e:
+    logger.warning(f"Coach import failed - falling back to dummy implementation: {e}")
     stream_llm_async = None
     PERSONA_PROMPTS = {}
 
@@ -48,103 +51,119 @@ async def get_user_from_token(token: str, db: AsyncSession) -> Optional[User]:
 
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = Query(None)):
-    await websocket.accept()
-    
-    # Check if it's a JWT or a username
-    async with AsyncSessionLocal() as db:
-        user = None
-        if token:
-            # Try JWT first
-            user = await get_user_from_token(token, db)
-            
-            # If JWT fails, try as plain username (fallback for dev)
-            if not user:
-                result = await db.execute(select(User).filter(User.username == token))
-                user = result.scalars().first()
+    user_id_str = "unknown"
+    try:
+        await websocket.accept()
+        logger.debug(f"WS Connection Attempt. Token: {token[:15] if token else 'None'}...")
         
-        if not user:
-            await websocket.close(code=1008)
-            return
-
-        # If we reach here, user is authenticated
-        user_id_str = user.username
-        await manager.connect(websocket, user_id_str)
-        
-        try:
-            while True:
-                data = await websocket.receive_text()
-                message = json.loads(data)
+        # Check if it's a JWT or a username
+        async with AsyncSessionLocal() as db:
+            user = None
+            if token:
+                # Try JWT first
+                user = await get_user_from_token(token, db)
                 
-                if message["type"] == "duel_request":
-                    target_id = message["target_id"]
-                    await manager.send_personal_message(json.dumps({
-                        "type": "duel_invite",
-                        "from": user_id_str,
-                        "exercise": message["exercise"]
-                    }), target_id)
+                # If JWT fails, try as plain username (fallback for dev)
+                if not user:
+                    logger.debug(f"WS Token decode failed, trying username fallback for: {token[:15]}...")
+                    result = await db.execute(select(User).filter(User.username == token))
+                    user = result.scalars().first()
+            
+            if not user:
+                logger.warning("WS Reject: User not found or no token")
+                await websocket.close(code=1008)
+                return
+    
+            # If we reach here, user is authenticated
+            user_id_str = user.username
+            logger.info(f"WS Authenticated: {user_id_str}")
+            await manager.connect(websocket, user_id_str)
+            
+            try:
+                while True:
+                    data = await websocket.receive_text()
+                    message = json.loads(data)
                     
-                elif message["type"] == "duel_accept":
-                    challenger_id = message["challenger_id"]
-                    exercise = message.get("exercise", "squats")
-                    await manager.send_personal_message(json.dumps({
-                        "type": "duel_start",
-                        "opponent": user_id_str,
-                        "exercise": exercise
-                    }), challenger_id)
-                    await manager.send_personal_message(json.dumps({
-                        "type": "duel_start",
-                        "opponent": challenger_id,
-                        "exercise": exercise
-                    }), user_id_str)
-                    
-                elif message["type"] == "duel_progress":
-                    opponent_id = message["opponent_id"]
-                    await manager.send_personal_message(json.dumps({
-                        "type": "opponent_progress",
-                        "reps": message["reps"]
-                    }), opponent_id)
-
-                elif message["type"] == "duel_end":
-                    opponent_id = message["opponent_id"]
-                    await manager.send_personal_message(json.dumps({
-                        "type": "duel_finished",
-                        "from": user_id_str,
-                        "reps": message["reps"]
-                    }), opponent_id)
-
-                elif message["type"] == "chat_message":
-                    target_username = message["target_username"]
-                    chat_text = message["message"]
-                    
-                    # Find target user
-                    res = await db.execute(select(User).filter(User.username == target_username))
-                    target_user = res.scalars().first()
-                    
-                    if target_user:
-                        # Save to DB
-                        new_msg = ChatMessage(
-                            sender_id=user.id,
-                            receiver_id=target_user.id,
-                            message=chat_text
-                        )
-                        db.add(new_msg)
-                        await db.commit()
-                        
-                        # Send real-time
+                    if message["type"] == "duel_request":
+                        target_id = message["target_id"]
                         await manager.send_personal_message(json.dumps({
-                            "type": "chat_received",
+                            "type": "duel_invite",
                             "from": user_id_str,
-                            "message": chat_text,
-                            "timestamp": new_msg.created_at.isoformat()
-                        }), target_username)
-
-        except WebSocketDisconnect:
-            await manager.disconnect(websocket, user_id_str)
+                            "exercise": message["exercise"]
+                        }), target_id)
+                        
+                    elif message["type"] == "duel_accept":
+                        challenger_id = message["challenger_id"]
+                        exercise = message.get("exercise", "squats")
+                        await manager.send_personal_message(json.dumps({
+                            "type": "duel_start",
+                            "opponent": user_id_str,
+                            "exercise": exercise
+                        }), challenger_id)
+                        await manager.send_personal_message(json.dumps({
+                            "type": "duel_start",
+                            "opponent": challenger_id,
+                            "exercise": exercise
+                        }), user_id_str)
+                        
+                    elif message["type"] == "duel_progress":
+                        opponent_id = message["opponent_id"]
+                        await manager.send_personal_message(json.dumps({
+                            "type": "opponent_progress",
+                            "reps": message["reps"]
+                        }), opponent_id)
+    
+                    elif message["type"] == "duel_end":
+                        opponent_id = message["opponent_id"]
+                        await manager.send_personal_message(json.dumps({
+                            "type": "duel_finished",
+                            "from": user_id_str,
+                            "reps": message["reps"]
+                        }), opponent_id)
+    
+                    elif message["type"] == "chat_message":
+                        target_username = message["target_username"]
+                        chat_text = message["message"]
+                        
+                        # Find target user
+                        res = await db.execute(select(User).filter(User.username == target_username))
+                        target_user = res.scalars().first()
+                        
+                        if target_user:
+                            # Save to DB
+                            new_msg = ChatMessage(
+                                sender_id=user.id,
+                                receiver_id=target_user.id,
+                                message=chat_text
+                            )
+                            db.add(new_msg)
+                            await db.commit()
+                             
+                            # Send real-time
+                            await manager.send_personal_message(json.dumps({
+                                "type": "chat_received",
+                                "from": user_id_str,
+                                "message": chat_text,
+                                "timestamp": new_msg.created_at.isoformat()
+                            }), target_username)
+    
+            except WebSocketDisconnect:
+                logger.info(f"WS Disconnected: {user_id_str}")
+                await manager.disconnect(websocket, user_id_str)
+            except Exception as e:
+                logger.error(f"WS Error for user {user_id_str}: {e}", exc_info=True)
+                await manager.disconnect(websocket, user_id_str)
+    except Exception as e:
+        logger.error(f"WS Connection error: {e}", exc_info=True)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 @router.websocket("/ws/vision")
 async def vision_websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
     try:
+        await websocket.accept()
         while True:
             data = await websocket.receive_text()
             message = json.loads(data)
@@ -179,59 +198,76 @@ async def vision_websocket_endpoint(websocket: WebSocket):
                             "type": "no_pose"
                         }))
     except WebSocketDisconnect:
-        pass
-    except Exception:
-        await websocket.close()
+        logger.debug("Vision WS disconnected")
+    except Exception as e:
+        logger.error(f"Vision WS error: {e}", exc_info=True)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 @router.websocket("/ws/coach")
 async def coach_websocket_endpoint(websocket: WebSocket, token: Optional[str] = Query(None)):
-    await websocket.accept()
-    async with AsyncSessionLocal() as db:
-        user = None
-        if token:
-            user = await get_user_from_token(token, db)
+    user_id_str = "unknown"
+    try:
+        await websocket.accept()
+        async with AsyncSessionLocal() as db:
+            user = None
+            if token:
+                user = await get_user_from_token(token, db)
+                if not user:
+                    res = await db.execute(select(User).filter(User.username == token))
+                    user = res.scalars().first()
+    
             if not user:
-                res = await db.execute(select(User).filter(User.username == token))
-                user = res.scalars().first()
-
-        if not user:
-            await websocket.close(code=1008)
-            return
-
-        chat_history = []  # keep conversation per connection
-
-        try:
-            while True:
-                data = await websocket.receive_text()
-                message = json.loads(data)
-                if message.get("type") == "ask":
-                    user_text = message.get("text") or "How am I doing?"
-                    persona = message.get("persona") or "supportive"
-                    session_context = message.get("session_context") or {}
-                    trend_data = await get_user_context(user, db)
-                    summary = format_fitness_summary(user, trend_data, session_context)
-                    if stream_llm_async:
-                        try:
-                            await websocket.send_text(json.dumps({"type": "coach_reply_start"}))
-                            accum = []
-                            async for delta in stream_llm_async(summary, user_text, persona):
-                                accum.append(delta)
-                                await websocket.send_text(json.dumps({"type": "coach_delta", "delta": delta}))
-                            
-                            reply = "".join(accum).strip()
-                            chat_history.append({"role": "user", "content": user_text})
-                            chat_history.append({"role": "assistant", "content": reply})
-                            await websocket.send_text(json.dumps({"type": "coach_reply_end", "reply": reply}))
-                        except Exception:
-                            await websocket.send_text(json.dumps({"type": "coach_reply_end", "reply": "I'm currently unavailable. Please try again."}))
-                    else:
-                        await websocket.send_text(json.dumps({"type": "coach_reply_end", "reply": f"{persona}: {user_text}"}))
-                else:
-                    await websocket.send_text(json.dumps({"type": "ack"}))
-        except WebSocketDisconnect:
-            return
-        except Exception:
+                logger.warning("Coach WS Reject: User not found or no token")
+                await websocket.close(code=1008)
+                return
+    
+            user_id_str = user.username
+            chat_history = []  # keep conversation per connection
+    
             try:
-                await websocket.send_text(json.dumps({"type": "error", "message": "Connection error"}))
-            finally:
-                await websocket.close()
+                while True:
+                    data = await websocket.receive_text()
+                    message = json.loads(data)
+                    if message.get("type") == "ask":
+                        user_text = message.get("text") or "How am I doing?"
+                        persona = message.get("persona") or "supportive"
+                        session_context = message.get("session_context") or {}
+                        trend_data = await get_user_context(user, db)
+                        summary = format_fitness_summary(user, trend_data, session_context)
+                        if stream_llm_async:
+                            try:
+                                await websocket.send_text(json.dumps({"type": "coach_reply_start"}))
+                                accum = []
+                                async for delta in stream_llm_async(summary, user_text, persona):
+                                    accum.append(delta)
+                                    await websocket.send_text(json.dumps({"type": "coach_delta", "delta": delta}))
+                                
+                                reply = "".join(accum).strip()
+                                chat_history.append({"role": "user", "content": user_text})
+                                chat_history.append({"role": "assistant", "content": reply})
+                                await websocket.send_text(json.dumps({"type": "coach_reply_end", "reply": reply}))
+                            except Exception as e:
+                                logger.error(f"WS Coach Error for user {user_id_str}: {e}", exc_info=True)
+                                await websocket.send_text(json.dumps({"type": "coach_reply_end", "reply": "I'm currently unavailable. Please try again."}))
+                        else:
+                            await websocket.send_text(json.dumps({"type": "coach_reply_end", "reply": f"{persona}: {user_text}"}))
+                    else:
+                        await websocket.send_text(json.dumps({"type": "ack"}))
+            except WebSocketDisconnect:
+                logger.info(f"Coach WS Disconnected: {user_id_str}")
+                return
+            except Exception as e:
+                logger.error(f"Coach WS Error for user {user_id_str}: {e}", exc_info=True)
+                try:
+                    await websocket.send_text(json.dumps({"type": "error", "message": "Connection error - please reconnect"}))
+                finally:
+                    await websocket.close()
+    except Exception as e:
+        logger.error(f"Coach WS Connection error: {e}", exc_info=True)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
